@@ -287,7 +287,7 @@ func (c *Cluster) Create() error {
 	c.logger.Infof("pods are ready")
 
 	// create database objects unless we are running without pods or disabled that feature explicitly
-	if !(c.databaseAccessDisabled() || c.getNumberOfInstances(&c.Spec) <= 0) {
+	if !(c.databaseAccessDisabled() || c.getNumberOfInstances(&c.Spec) <= 0 || c.Spec.StandbyCluster != nil) {
 		if err = c.createRoles(); err != nil {
 			return fmt.Errorf("could not create users: %v", err)
 		}
@@ -342,7 +342,7 @@ func (c *Cluster) compareStatefulSetWith(statefulSet *v1beta1.StatefulSet) *comp
 	if c.Statefulset.Spec.Template.Spec.ServiceAccountName != statefulSet.Spec.Template.Spec.ServiceAccountName {
 		needsReplace = true
 		needsRollUpdate = true
-		reasons = append(reasons, "new statefulset's serviceAccountName service asccount name doesn't match the current one")
+		reasons = append(reasons, "new statefulset's serviceAccountName service account name doesn't match the current one")
 	}
 	if *c.Statefulset.Spec.Template.Spec.TerminationGracePeriodSeconds != *statefulSet.Spec.Template.Spec.TerminationGracePeriodSeconds {
 		needsReplace = true
@@ -462,16 +462,16 @@ func (c *Cluster) compareContainers(description string, setA, setB []v1.Containe
 func compareResources(a *v1.ResourceRequirements, b *v1.ResourceRequirements) bool {
 	equal := true
 	if a != nil {
-		equal = compareResoucesAssumeFirstNotNil(a, b)
+		equal = compareResourcesAssumeFirstNotNil(a, b)
 	}
 	if equal && (b != nil) {
-		equal = compareResoucesAssumeFirstNotNil(b, a)
+		equal = compareResourcesAssumeFirstNotNil(b, a)
 	}
 
 	return equal
 }
 
-func compareResoucesAssumeFirstNotNil(a *v1.ResourceRequirements, b *v1.ResourceRequirements) bool {
+func compareResourcesAssumeFirstNotNil(a *v1.ResourceRequirements, b *v1.ResourceRequirements) bool {
 	if b == nil || (len(b.Requests) == 0) {
 		return len(a.Requests) == 0
 	}
@@ -579,6 +579,15 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 		}
 	}()
 
+	// pod disruption budget
+	if oldSpec.Spec.NumberOfInstances != newSpec.Spec.NumberOfInstances {
+		c.logger.Debug("syncing pod disruption budgets")
+		if err := c.syncPodDisruptionBudget(true); err != nil {
+			c.logger.Errorf("could not sync pod disruption budget: %v", err)
+			updateFailed = true
+		}
+	}
+
 	// logical backup job
 	func() {
 
@@ -617,7 +626,7 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	}()
 
 	// Roles and Databases
-	if !(c.databaseAccessDisabled() || c.getNumberOfInstances(&c.Spec) <= 0) {
+	if !(c.databaseAccessDisabled() || c.getNumberOfInstances(&c.Spec) <= 0 || c.Spec.StandbyCluster != nil) {
 		c.logger.Debugf("syncing roles")
 		if err := c.syncRoles(); err != nil {
 			c.logger.Errorf("could not sync roles: %v", err)
@@ -875,7 +884,7 @@ func (c *Cluster) initInfrastructureRoles() error {
 	return nil
 }
 
-// resolves naming conflicts between existing and new roles by chosing either of them.
+// resolves naming conflicts between existing and new roles by choosing either of them.
 func (c *Cluster) resolveNameConflict(currentRole, newRole *spec.PgUser) spec.PgUser {
 	var result spec.PgUser
 	if newRole.Origin >= currentRole.Origin {
@@ -969,7 +978,7 @@ func (c *Cluster) Switchover(curMaster *v1.Pod, candidate spec.NamespacedName) e
 	// signal the role label waiting goroutine to close the shop and go home
 	close(stopCh)
 	// wait until the goroutine terminates, since unregisterPodSubscriber
-	// must be called before the outer return; otherwsise we risk subscribing to the same pod twice.
+	// must be called before the outer return; otherwise we risk subscribing to the same pod twice.
 	wg.Wait()
 	// close the label waiting channel no sooner than the waiting goroutine terminates.
 	close(podLabelErr)

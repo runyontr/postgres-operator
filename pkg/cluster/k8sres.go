@@ -329,7 +329,7 @@ func tolerations(tolerationsSpec *[]v1.Toleration, podToleration map[string]stri
 	return []v1.Toleration{}
 }
 
-// isBootstrapOnlyParameter checks asgainst special Patroni bootstrap parameters.
+// isBootstrapOnlyParameter checks against special Patroni bootstrap parameters.
 // Those parameters must go to the bootstrap/dcs/postgresql/parameters section.
 // See http://patroni.readthedocs.io/en/latest/dynamic_configuration.html.
 func isBootstrapOnlyParameter(param string) bool {
@@ -342,11 +342,12 @@ func isBootstrapOnlyParameter(param string) bool {
 		param == "track_commit_timestamp"
 }
 
-func generateVolumeMounts() []v1.VolumeMount {
+func generateVolumeMounts(volume acidv1.Volume) []v1.VolumeMount {
 	return []v1.VolumeMount{
 		{
 			Name:      constants.DataVolumeName,
 			MountPath: constants.PostgresDataMount, //TODO: fetch from manifest
+			SubPath:   volume.SubPath,
 		},
 	}
 }
@@ -381,7 +382,8 @@ func generateContainer(
 		VolumeMounts: volumeMounts,
 		Env:          envVars,
 		SecurityContext: &v1.SecurityContext{
-			Privileged: &privilegedMode,
+			Privileged:             &privilegedMode,
+			ReadOnlyRootFilesystem: util.False(),
 		},
 	}
 }
@@ -417,9 +419,9 @@ func generateSidecarContainers(sidecars []acidv1.Sidecar,
 
 // Check whether or not we're requested to mount an shm volume,
 // taking into account that PostgreSQL manifest has precedence.
-func mountShmVolumeNeeded(opConfig config.Config, pgSpec *acidv1.PostgresSpec) bool {
-	if pgSpec.ShmVolume != nil {
-		return *pgSpec.ShmVolume
+func mountShmVolumeNeeded(opConfig config.Config, pgSpec *acidv1.PostgresSpec) *bool {
+	if pgSpec.ShmVolume != nil && *pgSpec.ShmVolume {
+		return pgSpec.ShmVolume
 	}
 
 	return opConfig.ShmVolume
@@ -432,19 +434,27 @@ func generatePodTemplate(
 	initContainers []v1.Container,
 	sidecarContainers []v1.Container,
 	tolerationsSpec *[]v1.Toleration,
+	spiloFSGroup *int64,
 	nodeAffinity *v1.Affinity,
 	terminateGracePeriod int64,
 	podServiceAccountName string,
 	kubeIAMRole string,
 	priorityClassName string,
-	shmVolume bool,
+	shmVolume *bool,
 	podAntiAffinity bool,
 	podAntiAffinityTopologyKey string,
+	additionalSecretMount string,
+	additionalSecretMountPath string,
 ) (*v1.PodTemplateSpec, error) {
 
 	terminateGracePeriodSeconds := terminateGracePeriod
 	containers := []v1.Container{*spiloContainer}
 	containers = append(containers, sidecarContainers...)
+	securityContext := v1.PodSecurityContext{}
+
+	if spiloFSGroup != nil {
+		securityContext.FSGroup = spiloFSGroup
+	}
 
 	podSpec := v1.PodSpec{
 		ServiceAccountName:            podServiceAccountName,
@@ -452,9 +462,10 @@ func generatePodTemplate(
 		Containers:                    containers,
 		InitContainers:                initContainers,
 		Tolerations:                   *tolerationsSpec,
+		SecurityContext:               &securityContext,
 	}
 
-	if shmVolume {
+	if shmVolume != nil && *shmVolume {
 		addShmVolume(&podSpec)
 	}
 
@@ -466,6 +477,10 @@ func generatePodTemplate(
 
 	if priorityClassName != "" {
 		podSpec.PriorityClassName = priorityClassName
+	}
+
+	if additionalSecretMount != "" {
+		addSecretVolume(&podSpec, additionalSecretMount, additionalSecretMountPath)
 	}
 
 	template := v1.PodTemplateSpec{
@@ -483,7 +498,7 @@ func generatePodTemplate(
 }
 
 // generatePodEnvVars generates environment variables for the Spilo Pod
-func (c *Cluster) generateSpiloPodEnvVars(uid types.UID, spiloConfiguration string, cloneDescription *acidv1.CloneDescription, customPodEnvVarsList []v1.EnvVar) []v1.EnvVar {
+func (c *Cluster) generateSpiloPodEnvVars(uid types.UID, spiloConfiguration string, cloneDescription *acidv1.CloneDescription, standbyDescription *acidv1.StandbyDescription, customPodEnvVarsList []v1.EnvVar) []v1.EnvVar {
 	envVars := []v1.EnvVar{
 		{
 			Name:  "SCOPE",
@@ -585,6 +600,10 @@ func (c *Cluster) generateSpiloPodEnvVars(uid types.UID, spiloConfiguration stri
 
 	if cloneDescription.ClusterName != "" {
 		envVars = append(envVars, c.generateCloneEnvironment(cloneDescription)...)
+	}
+
+	if c.Spec.StandbyCluster != nil {
+		envVars = append(envVars, c.generateStandbyEnvironment(standbyDescription)...)
 	}
 
 	if len(customPodEnvVarsList) > 0 {
@@ -785,6 +804,31 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*v1beta1.State
 		sort.Slice(customPodEnvVarsList,
 			func(i, j int) bool { return customPodEnvVarsList[i].Name < customPodEnvVarsList[j].Name })
 	}
+	if spec.StandbyCluster != nil && spec.StandbyCluster.S3WalPath == "" {
+		return nil, fmt.Errorf("s3_wal_path is empty for standby cluster")
+	}
+
+	// backward compatible check for InitContainers
+	if spec.InitContainersOld != nil {
+		msg := "Manifest parameter init_containers is deprecated."
+		if spec.InitContainers == nil {
+			c.logger.Warningf("%s Consider using initContainers instead.", msg)
+			spec.InitContainers = spec.InitContainersOld
+		} else {
+			c.logger.Warningf("%s Only value from initContainers is used", msg)
+		}
+	}
+
+	// backward compatible check for PodPriorityClassName
+	if spec.PodPriorityClassNameOld != "" {
+		msg := "Manifest parameter pod_priority_class_name is deprecated."
+		if spec.PodPriorityClassName == "" {
+			c.logger.Warningf("%s Consider using podPriorityClassName instead.", msg)
+			spec.PodPriorityClassName = spec.PodPriorityClassNameOld
+		} else {
+			c.logger.Warningf("%s Only value from podPriorityClassName is used", msg)
+		}
+	}
 
 	spiloConfiguration, err := generateSpiloJSONConfiguration(&spec.PostgresqlParam, &spec.Patroni, c.OpConfig.PamRoleName, c.logger)
 	if err != nil {
@@ -794,12 +838,12 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*v1beta1.State
 	// generate environment variables for the spilo container
 	spiloEnvVars := deduplicateEnvVars(
 		c.generateSpiloPodEnvVars(c.Postgresql.GetUID(), spiloConfiguration, &spec.Clone,
-			customPodEnvVarsList), c.containerName(), c.logger)
+			spec.StandbyCluster, customPodEnvVarsList), c.containerName(), c.logger)
 
 	// pickup the docker image for the spilo container
 	effectiveDockerImage := util.Coalesce(spec.DockerImage, c.OpConfig.DockerImage)
 
-	volumeMounts := generateVolumeMounts()
+	volumeMounts := generateVolumeMounts(spec.Volume)
 
 	// generate the spilo container
 	c.logger.Debugf("Generating Spilo container, environment variables: %v", spiloEnvVars)
@@ -846,6 +890,12 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*v1beta1.State
 	tolerationSpec := tolerations(&spec.Tolerations, c.OpConfig.PodToleration)
 	effectivePodPriorityClassName := util.Coalesce(spec.PodPriorityClassName, c.OpConfig.PodPriorityClassName)
 
+	// determine the FSGroup for the spilo pod
+	effectiveFSGroup := c.OpConfig.Resources.SpiloFSGroup
+	if spec.SpiloFSGroup != nil {
+		effectiveFSGroup = spec.SpiloFSGroup
+	}
+
 	// generate pod template for the statefulset, based on the spilo container and sidecars
 	if podTemplate, err = generatePodTemplate(
 		c.Namespace,
@@ -854,6 +904,7 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*v1beta1.State
 		initContainers,
 		sidecarContainers,
 		&tolerationSpec,
+		effectiveFSGroup,
 		nodeAffinity(c.OpConfig.NodeReadinessLabel),
 		int64(c.OpConfig.PodTerminateGracePeriod.Seconds()),
 		c.OpConfig.PodServiceAccountName,
@@ -861,7 +912,9 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*v1beta1.State
 		effectivePodPriorityClassName,
 		mountShmVolumeNeeded(c.OpConfig, spec),
 		c.OpConfig.EnablePodAntiAffinity,
-		c.OpConfig.PodAntiAffinityTopologyKey); err != nil {
+		c.OpConfig.PodAntiAffinityTopologyKey,
+		c.OpConfig.AdditionalSecretMount,
+		c.OpConfig.AdditionalSecretMountPath); err != nil {
 		return nil, fmt.Errorf("could not generate pod template: %v", err)
 	}
 
@@ -971,6 +1024,11 @@ func (c *Cluster) getNumberOfInstances(spec *acidv1.PostgresSpec) int32 {
 	cur := spec.NumberOfInstances
 	newcur := cur
 
+	/* Limit the max number of pods to one, if this is standby-cluster */
+	if spec.StandbyCluster != nil {
+		c.logger.Info("Standby cluster can have maximum of 1 pod")
+		max = 1
+	}
 	if max >= 0 && newcur > max {
 		newcur = max
 	}
@@ -1007,6 +1065,28 @@ func addShmVolume(podSpec *v1.PodSpec) {
 		})
 
 	podSpec.Containers[0].VolumeMounts = mounts
+	podSpec.Volumes = volumes
+}
+
+func addSecretVolume(podSpec *v1.PodSpec, additionalSecretMount string, additionalSecretMountPath string) {
+	volumes := append(podSpec.Volumes, v1.Volume{
+		Name: additionalSecretMount,
+		VolumeSource: v1.VolumeSource{
+			Secret: &v1.SecretVolumeSource{
+				SecretName: additionalSecretMount,
+			},
+		},
+	})
+
+	for i := range podSpec.Containers {
+		mounts := append(podSpec.Containers[i].VolumeMounts,
+			v1.VolumeMount{
+				Name:      additionalSecretMount,
+				MountPath: additionalSecretMountPath,
+			})
+		podSpec.Containers[i].VolumeMounts = mounts
+	}
+
 	podSpec.Volumes = volumes
 }
 
@@ -1267,13 +1347,63 @@ func (c *Cluster) generateCloneEnvironment(description *acidv1.CloneDescription)
 		result = append(result, v1.EnvVar{Name: "CLONE_METHOD", Value: "CLONE_WITH_WALE"})
 		result = append(result, v1.EnvVar{Name: "CLONE_TARGET_TIME", Value: description.EndTimestamp})
 		result = append(result, v1.EnvVar{Name: "CLONE_WAL_BUCKET_SCOPE_PREFIX", Value: ""})
+
+		if description.S3Endpoint != "" {
+			result = append(result, v1.EnvVar{Name: "CLONE_AWS_ENDPOINT", Value: description.S3Endpoint})
+			result = append(result, v1.EnvVar{Name: "CLONE_WALE_S3_ENDPOINT", Value: description.S3Endpoint})
+		}
+
+		if description.S3AccessKeyId != "" {
+			result = append(result, v1.EnvVar{Name: "CLONE_AWS_ACCESS_KEY_ID", Value: description.S3AccessKeyId})
+		}
+
+		if description.S3SecretAccessKey != "" {
+			result = append(result, v1.EnvVar{Name: "CLONE_AWS_SECRET_ACCESS_KEY", Value: description.S3SecretAccessKey})
+		}
+
+		if description.S3ForcePathStyle != nil {
+			s3ForcePathStyle := "0"
+
+			if *description.S3ForcePathStyle {
+				s3ForcePathStyle = "1"
+			}
+
+			result = append(result, v1.EnvVar{Name: "CLONE_AWS_S3_FORCE_PATH_STYLE", Value: s3ForcePathStyle})
+		}
 	}
+
+	return result
+}
+
+func (c *Cluster) generateStandbyEnvironment(description *acidv1.StandbyDescription) []v1.EnvVar {
+	result := make([]v1.EnvVar, 0)
+
+	if description.S3WalPath == "" {
+		return nil
+	}
+	// standby with S3, find out the bucket to setup standby
+	msg := "Standby from S3 bucket using custom parsed S3WalPath from the manifest %s "
+	c.logger.Infof(msg, description.S3WalPath)
+
+	result = append(result, v1.EnvVar{
+		Name:  "STANDBY_WALE_S3_PREFIX",
+		Value: description.S3WalPath,
+	})
+
+	result = append(result, v1.EnvVar{Name: "STANDBY_METHOD", Value: "STANDBY_WITH_WALE"})
+	result = append(result, v1.EnvVar{Name: "STANDBY_WAL_BUCKET_SCOPE_PREFIX", Value: ""})
 
 	return result
 }
 
 func (c *Cluster) generatePodDisruptionBudget() *policybeta1.PodDisruptionBudget {
 	minAvailable := intstr.FromInt(1)
+	pdbEnabled := c.OpConfig.EnablePodDisruptionBudget
+
+	// if PodDisruptionBudget is disabled or if there are no DB pods, set the budget to 0.
+	if (pdbEnabled != nil && !*pdbEnabled) || c.Spec.NumberOfInstances <= 0 {
+		minAvailable = intstr.FromInt(0)
+	}
 
 	return &policybeta1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1355,18 +1485,21 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1beta1.CronJob, error) {
 		[]v1.Container{},
 		[]v1.Container{},
 		&[]v1.Toleration{},
+		nil,
 		nodeAffinity(c.OpConfig.NodeReadinessLabel),
 		int64(c.OpConfig.PodTerminateGracePeriod.Seconds()),
 		c.OpConfig.PodServiceAccountName,
 		c.OpConfig.KubeIAMRole,
 		"",
+		util.False(),
 		false,
-		false,
+		"",
+		"",
 		""); err != nil {
 		return nil, fmt.Errorf("could not generate pod template for logical backup pod: %v", err)
 	}
 
-	// overwrite specifc params of logical backups pods
+	// overwrite specific params of logical backups pods
 	podTemplate.Spec.Affinity = &podAffinity
 	podTemplate.Spec.RestartPolicy = "Never" // affects containers within a pod
 
@@ -1409,6 +1542,15 @@ func (c *Cluster) generateLogicalBackupPodEnvVars() []v1.EnvVar {
 		{
 			Name:  "SCOPE",
 			Value: c.Name,
+		},
+		{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &v1.EnvVarSource{
+				FieldRef: &v1.ObjectFieldSelector{
+					APIVersion: "v1",
+					FieldPath:  "metadata.namespace",
+				},
+			},
 		},
 		// Bucket env vars
 		{
